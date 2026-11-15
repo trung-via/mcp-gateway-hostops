@@ -1,0 +1,110 @@
+# Active dedicated MCP Gateway HostOps workflow; owner-only issue authorization.
+name: MCP Gateway dedicated P2 IPv6 provider-control (one operation)
+on:
+  issues:
+    types: [opened]
+
+permissions: {}
+
+concurrency:
+  group: mcp-gateway-dedicated-p2-provider-control
+  cancel-in-progress: false
+
+jobs:
+  authorize-on-github-hosted:
+    runs-on: windows-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      approved: ${{ steps.authorize.outputs.approved }}
+    steps:
+      - id: authorize
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $approved = $false
+          $event = Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json -Depth 40
+          $issue = $event.issue
+          if ($null -ne $issue -and
+              $event.action -eq 'opened' -and
+              [string]$event.repository.full_name -ceq 'trung-via/mcp-gateway-hostops' -and
+              [string]$env:GITHUB_REPOSITORY -ceq 'trung-via/mcp-gateway-hostops' -and
+              [string]$env:GITHUB_ACTOR -ceq 'trung-via' -and
+              [string]$event.sender.login -ceq 'trung-via' -and
+              [string]$issue.user.login -ceq 'trung-via' -and
+              [string]$issue.title -ceq 'MCP_P2_IPV6_PROVIDER_CONTROL_READONLY_V1' -and
+              [string]$issue.body -ceq '{}' -and
+              $null -eq $issue.pull_request -and
+              [string]$env:GITHUB_RUN_ATTEMPT -ceq '1') {
+            $created = [DateTimeOffset]::Parse([string]$issue.created_at)
+            $age = [DateTimeOffset]::UtcNow - $created.ToUniversalTime()
+            $approved = $age.TotalSeconds -ge -30 -and $age.TotalSeconds -le 300
+          }
+          if ($approved) {
+            'approved=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            'MCP_HOSTOPS_HOSTOPS_AUTH=PASS'
+          } else {
+            'approved=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            'MCP_HOSTOPS_HOSTOPS_AUTH=DENY'
+          }
+
+  execute-on-dedicated-windows:
+    needs: authorize-on-github-hosted
+    if: needs.authorize-on-github-hosted.outputs.approved == 'true'
+    runs-on: [self-hosted, windows, X64, mcp-gateway-hostops]
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout trusted dedicated main only
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Verify fixed exact source and execute one read-only operation
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOSTOPS_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          HOSTOPS_RUN_ID: ${{ github.run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = 'scripts/hostops/p2-ipv6-provider-controls-readonly.ps1'
+          if ($env:HOSTOPS_ISSUE_NUMBER -notmatch '^[0-9]{1,12}$' -or
+              $env:HOSTOPS_RUN_ID -notmatch '^[0-9]{1,20}$') { throw 'INVALID_CORRELATION_ID' }
+          if (-not (Test-Path -LiteralPath $script -PathType Leaf)) { throw 'SOURCE_MISSING' }
+          # Git blob SHA of the reviewed public PR #10 script; ensure LF checkout in dedicated repo.
+          $expectedBlob = '1172099c35eccb56d694d9a3c2f4fa3a145aced5'
+          $actualBlob = (& git hash-object --no-filters -- $script).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualBlob -cne $expectedBlob) { throw 'SOURCE_BLOB_MISMATCH' }
+          $lines = @(& pwsh -NoProfile -NonInteractive -File $script 2>$null)
+          if ($LASTEXITCODE -ne 0 -or $lines.Count -ne 1 -or
+              -not ([string]$lines[0]).StartsWith('MCP_P2_HOSTOPS_RECEIPT_V1=')) {
+            throw 'INVALID_RECEIPT'
+          }
+          $payload = ([string]$lines[0]).Substring('MCP_P2_HOSTOPS_RECEIPT_V1='.Length)
+          $receipt = $payload | ConvertFrom-Json -Depth 5
+          if ($receipt.schema -cne 'MCP_P2_HOSTOPS_RECEIPT_V1' -or
+              $receipt.operation -cne 'MCP_P2_IPV6_PROVIDER_CONTROL_READONLY_V1' -or
+              $receipt.status -cnotin @('CONTROLS_PASS','CONTROLS_BLOCKED')) {
+            throw 'RECEIPT_SCHEMA_DENY'
+          }
+          $expectedKeys = @('schema','operation','utc','status','tcpdata_status','tcpdata_error',
+            'checkhost_status','checkhost_error','checkhost_selected_nodes','checkhost_ipv6_nodes',
+            'checkhost_ipv4_nodes','checkhost_error_nodes','checkhost_pending_nodes',
+            'checkhost_schema_nodes','checkhost_distinct_asns')
+          $actualKeys = @($receipt.PSObject.Properties.Name)
+          if (@($actualKeys | Where-Object { $_ -notin $expectedKeys }).Count -ne 0 -or
+              $actualKeys.Count -ne $expectedKeys.Count) { throw 'RECEIPT_KEY_DENY' }
+          # Only the fixed sanitized receipt is posted; no cross-repo credential.
+          $body = "MCP_P2_HOSTOPS_HOSTOPS_EXECUTION_V1`nrun_id=$env:HOSTOPS_RUN_ID`nsource_blob=$expectedBlob`n$($lines[0])"
+          $url = "https://api.github.com/repos/trung-via/mcp-gateway-hostops/issues/$env:HOSTOPS_ISSUE_NUMBER/comments"
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          try {
+            Invoke-RestMethod -Uri $url -Method Post -Headers $headers -Body (@{ body = $body } | ConvertTo-Json -Compress) -ContentType 'application/json' -TimeoutSec 15 | Out-Null
+            'MCP_P2_HOSTOPS_RECEIPT_POSTED=YES'
+          } catch {
+            throw 'HOSTOPS_RECEIPT_POST_FAILED'
+          }
